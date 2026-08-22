@@ -7,10 +7,18 @@
     <Nullable>enable</Nullable>
     <AssemblyName>NoxoParental</AssemblyName>
     <RootNamespace>NoxoParental</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Proton" Version="1.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Always" />
+  </ItemGroup>
 </Project>
