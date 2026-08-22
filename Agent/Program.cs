@@ -24,7 +24,7 @@ public sealed class MainForm : Form
     private readonly Label update = new();
     private readonly ListBox events = new();
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 10000 };
-    private readonly LocalServer localServer;
+    private LocalServer? localServer;
     private bool checking;
     private int port = DefaultPort;
 
@@ -52,30 +52,37 @@ public sealed class MainForm : Form
         events.Location = new Point(30, 275); events.Size = new Size(720, 220); events.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         Controls.AddRange([title, subtitle, status, server, activity, update, retry, openDashboard, checkUpdate, events]);
 
-        localServer = new LocalServer(DefaultPort, GetConfig, AddEvent);
-        localServer.Start();
-        if (!localServer.IsRunning)
-        {
-            for (var candidate = DefaultPort + 1; candidate <= DefaultPort + 5 && !localServer.IsRunning; candidate++)
-            {
-                // A new LocalServer is required because HttpListener prefixes are immutable after construction.
-                localServer.Dispose();
-                port = candidate;
-                break;
-            }
-        }
-
+        StartLocalServer();
         Shown += async (_, _) => { await CheckServer(); await CheckForUpdate(false); };
         timer.Tick += async (_, _) => { await CheckServer(); await CheckForUpdate(false); };
         timer.Start();
     }
 
+    private void StartLocalServer()
+    {
+        for (var candidate = DefaultPort; candidate <= DefaultPort + 10; candidate++)
+        {
+            var candidateServer = new LocalServer(candidate, GetConfig, AddEvent);
+            candidateServer.Start();
+            if (candidateServer.IsRunning)
+            {
+                localServer = candidateServer;
+                port = candidate;
+                AddEvent("server", $"Serveur disponible sur 127.0.0.1:{port}");
+                return;
+            }
+            candidateServer.Dispose();
+        }
+
+        AddEvent("error", $"Impossible d'ouvrir les ports {DefaultPort}-{DefaultPort + 10}.");
+    }
+
     private object GetConfig() => new
     {
-        daily_limit_minutes = 120,
-        start_time = "08:00",
-        end_time = "21:00",
-        blocked_apps = Array.Empty<string>()
+        DailyLimitMinutes = 120,
+        StartTime = "08:00",
+        EndTime = "21:00",
+        BlockedApps = Array.Empty<string>()
     };
 
     private async Task CheckServer()
@@ -84,6 +91,9 @@ public sealed class MainForm : Form
         checking = true;
         try
         {
+            if (localServer is null || !localServer.IsRunning)
+                StartLocalServer();
+
             var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config");
             response.EnsureSuccessStatusCode();
             var config = await response.Content.ReadFromJsonAsync<AgentConfig>();
@@ -134,7 +144,7 @@ public sealed class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        timer.Stop(); localServer.Dispose(); http.Dispose(); base.OnFormClosed(e);
+        timer.Stop(); localServer?.Dispose(); http.Dispose(); base.OnFormClosed(e);
     }
 }
 
