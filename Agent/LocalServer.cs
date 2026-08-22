@@ -1,17 +1,18 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Logging;
 
 namespace NoxoParental;
 
 public sealed class LocalServer : IDisposable
 {
-    private WebApplication? app;
     private readonly int port;
     private readonly SettingsStore settings;
     private readonly Action<string, string> log;
+    private TcpListener? listener;
+    private CancellationTokenSource? cts;
+    private Task? loop;
 
     public LocalServer(int port, SettingsStore settings, Action<string, string> log)
     {
@@ -27,213 +28,187 @@ public sealed class LocalServer : IDisposable
     public void Start()
     {
         if (IsRunning) return;
-
         try
         {
-            var builder = WebApplication.CreateBuilder(new WebApplicationOptions
-            {
-                Args = Array.Empty<string>(),
-                ApplicationName = typeof(LocalServer).Assembly.GetName().Name
-            });
-
-            builder.Logging.ClearProviders();
-            builder.WebHost.UseUrls(Url);
-            app = builder.Build();
-
-            app.Use(async (context, next) =>
-            {
-                context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
-                await next();
-            });
-
-            app.MapGet("/api/status", () => Results.Json(new
-            {
-                ok = true,
-                service = "Noxo Parental Control",
-                embedded = true,
-                port,
-                version = UpdateChecker.CurrentVersion.ToString(3),
-                time = DateTimeOffset.UtcNow
-            }));
-
-            app.MapGet("/api/settings", () => Results.Json(PublicSettings()));
-
-            app.MapPost("/api/settings", async (HttpRequest request) =>
-            {
-                if (!await IsAuthorized(request))
-                    return Results.Unauthorized();
-
-                var dto = await JsonSerializer.DeserializeAsync<SettingsDto>(request.Body);
-                if (dto is null)
-                    return Results.BadRequest(new { error = "Configuration invalide." });
-
-                if (dto.DailyLimitMinutes is < 1 or > 1440)
-                    return Results.BadRequest(new { error = "Limite quotidienne invalide." });
-
-                if (!TimeSpan.TryParse(dto.StartTime, out var start) ||
-                    !TimeSpan.TryParse(dto.EndTime, out var end) ||
-                    start.TotalHours >= 24 || end.TotalHours >= 24)
-                    return Results.BadRequest(new { error = "Horaires invalides." });
-
-                var apps = (dto.BlockedApps ?? new List<string>())
-                    .Select(x => x.Trim().ToLowerInvariant())
-                    .Where(x => x.Length > 0 && x.Length <= 80)
-                    .Where(x => x.All(c => char.IsLetterOrDigit(c) || c is '.' or '_' or '-'))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Take(100)
-                    .ToList();
-
-                settings.Update(s =>
-                {
-                    s.DailyLimitMinutes = dto.DailyLimitMinutes;
-                    s.StartTime = start.ToString(@"hh\:mm");
-                    s.EndTime = end.ToString(@"hh\:mm");
-                    s.ObservationMode = dto.ObservationMode;
-                    s.BlockedApps = apps;
-                });
-
-                log("settings", "Paramètres modifiés depuis le dashboard.");
-                return Results.Ok(PublicSettings());
-            });
-
-            app.MapPost("/api/pin", async (HttpRequest request) =>
-            {
-                if (!await IsAuthorized(request))
-                    return Results.Unauthorized();
-
-                var dto = await JsonSerializer.DeserializeAsync<PinDto>(request.Body);
-                if (dto?.Pin is null || dto.Pin.Length < 4 || dto.Pin.Length > 12 || !dto.Pin.All(char.IsDigit))
-                    return Results.BadRequest(new { error = "Le PIN doit contenir 4 à 12 chiffres." });
-
-                settings.SetPin(dto.Pin);
-                log("security", "PIN parent modifié.");
-                return Results.Ok(new { ok = true });
-            });
-
-            app.MapGet("/api/agent-config", () => Results.Json(PublicSettings()));
-
-            app.MapPost("/api/agent-event", async (HttpRequest request) =>
-            {
-                try
-                {
-                    var item = await JsonSerializer.DeserializeAsync<AgentEvent>(request.Body);
-                    if (item != null && !string.IsNullOrWhiteSpace(item.Message))
-                    {
-                        var message = item.Message[..Math.Min(item.Message.Length, 500)];
-                        log(item.Type ?? "agent", message);
-                    }
-                }
-                catch (JsonException)
-                {
-                    // Ignore malformed agent telemetry.
-                }
-
-                return Results.Json(new { ok = true });
-            });
-
-            app.MapGet("/", () => Results.Content(DashboardHtml(), "text/html; charset=utf-8"));
-            app.MapGet("/dashboard", () => Results.Content(DashboardHtml(), "text/html; charset=utf-8"));
-
-            app.StartAsync().GetAwaiter().GetResult();
+            listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Start(64);
+            cts = new CancellationTokenSource();
+            loop = Task.Run(() => AcceptLoopAsync(cts.Token));
             IsRunning = true;
-            log("server", $"Serveur web intégré démarré sur {Url}");
+            log("server", $"Serveur local démarré sur {Url}");
         }
         catch (Exception ex)
         {
             IsRunning = false;
-            try { app?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-            app = null;
-            log("error", $"Impossible de démarrer le serveur web sur {Url} : {ex.Message}");
+            listener = null;
+            log("error", $"Port {port} indisponible : {ex.Message}");
         }
+    }
+
+    private async Task AcceptLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested && listener != null)
+        {
+            try
+            {
+                var client = await listener.AcceptTcpClientAsync(token);
+                _ = Task.Run(() => HandleClientAsync(client, token), token);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException) { break; }
+            catch (Exception ex) { log("server", ex.Message); }
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken token)
+    {
+        using (client)
+        using (var stream = client.GetStream())
+        {
+            stream.ReadTimeout = 5000;
+            stream.WriteTimeout = 5000;
+            try
+            {
+                var buffer = new byte[65536];
+                var length = await stream.ReadAsync(buffer, token);
+                if (length <= 0) return;
+                var request = Encoding.UTF8.GetString(buffer, 0, length);
+                var headerEnd = request.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                if (headerEnd < 0) { await Send(stream, 400, "text/plain; charset=utf-8", "Bad Request"); return; }
+
+                var header = request[..headerEnd];
+                var body = request[(headerEnd + 4)..];
+                var firstLine = header.Split("\r\n", StringSplitOptions.None)[0].Split(' ');
+                if (firstLine.Length < 2) { await Send(stream, 400, "text/plain; charset=utf-8", "Bad Request"); return; }
+
+                var method = firstLine[0];
+                var path = firstLine[1].Split('?', 2)[0];
+                var headers = ParseHeaders(header);
+
+                // Read a larger JSON body when Content-Length says it exists.
+                if (headers.TryGetValue("content-length", out var contentLengthText) && int.TryParse(contentLengthText, out var contentLength))
+                {
+                    contentLength = Math.Clamp(contentLength, 0, 65536);
+                    while (Encoding.UTF8.GetByteCount(body) < contentLength)
+                    {
+                        var remaining = new byte[Math.Min(65536, contentLength - Encoding.UTF8.GetByteCount(body))];
+                        var n = await stream.ReadAsync(remaining, token);
+                        if (n <= 0) break;
+                        body += Encoding.UTF8.GetString(remaining, 0, n);
+                    }
+                }
+
+                if (method == "GET" && (path == "/" || path == "/dashboard"))
+                {
+                    await Send(stream, 200, "text/html; charset=utf-8", DashboardHtml());
+                    return;
+                }
+
+                if (method == "GET" && path == "/api/status")
+                {
+                    await Json(stream, new { ok = true, service = "Noxo Parental Control", embedded = true, port, version = UpdateChecker.CurrentVersion.ToString(3), time = DateTimeOffset.UtcNow });
+                    return;
+                }
+
+                if (method == "GET" && (path == "/api/settings" || path == "/api/agent-config"))
+                {
+                    await Json(stream, PublicSettings());
+                    return;
+                }
+
+                if (method == "POST" && path == "/api/settings")
+                {
+                    if (!Authorized(headers)) { await Json(stream, new { error = "PIN parent requis." }, 401); return; }
+                    var dto = JsonSerializer.Deserialize<SettingsDto>(body, JsonOptions);
+                    if (dto is null || dto.DailyLimitMinutes is < 1 or > 1440) { await Json(stream, new { error = "Configuration invalide." }, 400); return; }
+                    if (!TimeSpan.TryParse(dto.StartTime, out var start) || !TimeSpan.TryParse(dto.EndTime, out var end) || start.TotalHours >= 24 || end.TotalHours >= 24)
+                    { await Json(stream, new { error = "Horaires invalides." }, 400); return; }
+                    var apps = (dto.BlockedApps ?? []).Select(CleanApp).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Take(100).ToList();
+                    settings.Update(s => { s.DailyLimitMinutes = dto.DailyLimitMinutes; s.StartTime = start.ToString(@"hh\:mm"); s.EndTime = end.ToString(@"hh\:mm"); s.ObservationMode = dto.ObservationMode; s.BlockedApps = apps; });
+                    log("settings", "Paramètres modifiés depuis le dashboard.");
+                    await Json(stream, PublicSettings());
+                    return;
+                }
+
+                if (method == "POST" && path == "/api/pin")
+                {
+                    if (!Authorized(headers)) { await Json(stream, new { error = "PIN parent requis." }, 401); return; }
+                    var dto = JsonSerializer.Deserialize<PinDto>(body, JsonOptions);
+                    if (dto?.Pin is null || dto.Pin.Length < 4 || dto.Pin.Length > 12 || !dto.Pin.All(char.IsDigit)) { await Json(stream, new { error = "PIN invalide." }, 400); return; }
+                    settings.SetPin(dto.Pin);
+                    log("security", "PIN parent modifié.");
+                    await Json(stream, new { ok = true });
+                    return;
+                }
+
+                if (method == "POST" && path == "/api/agent-event")
+                {
+                    try
+                    {
+                        var item = JsonSerializer.Deserialize<AgentEvent>(body, JsonOptions);
+                        if (item != null && !string.IsNullOrWhiteSpace(item.Message)) log(item.Type ?? "agent", item.Message[..Math.Min(500, item.Message.Length)]);
+                    }
+                    catch (JsonException) { }
+                    await Json(stream, new { ok = true });
+                    return;
+                }
+
+                await Send(stream, 404, "text/plain; charset=utf-8", "Not Found");
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { log("server", ex.Message); }
+        }
+    }
+
+    private bool Authorized(Dictionary<string, string> headers) => headers.TryGetValue("x-parent-pin", out var pin) && settings.VerifyPin(pin);
+
+    private static string CleanApp(string value)
+    {
+        var x = (value ?? "").Trim().ToLowerInvariant();
+        if (x.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) x = x[..^4];
+        return x.Length is > 0 and <= 80 && x.All(c => char.IsLetterOrDigit(c) || c is '.' or '_' or '-') ? x : "";
     }
 
     private object PublicSettings()
     {
         var s = settings.Snapshot();
-        return new
+        return new { s.DailyLimitMinutes, s.StartTime, s.EndTime, s.BlockedApps, s.ObservationMode };
+    }
+
+    private static Dictionary<string, string> ParseHeaders(string header)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in header.Split("\r\n").Skip(1))
         {
-            s.DailyLimitMinutes,
-            s.StartTime,
-            s.EndTime,
-            s.BlockedApps,
-            s.ObservationMode
-        };
+            var i = line.IndexOf(':');
+            if (i > 0) result[line[..i].Trim()] = line[(i + 1)..].Trim();
+        }
+        return result;
     }
 
-    private Task<bool> IsAuthorized(HttpRequest request)
+    private static async Task Json(NetworkStream stream, object data, int status = 200) => await Send(stream, status, "application/json; charset=utf-8", JsonSerializer.Serialize(data, JsonOptions));
+
+    private static async Task Send(NetworkStream stream, int status, string contentType, string content)
     {
-        var pin = request.Headers["X-Parent-Pin"].FirstOrDefault();
-        return Task.FromResult(!string.IsNullOrWhiteSpace(pin) && settings.VerifyPin(pin));
+        var bytes = Encoding.UTF8.GetBytes(content);
+        var text = status switch { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 404 => "Not Found", _ => "Error" };
+        var head = $"HTTP/1.1 {status} {text}\r\nContent-Type: {contentType}\r\nContent-Length: {bytes.Length}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+        var header = Encoding.ASCII.GetBytes(head);
+        await stream.WriteAsync(header);
+        await stream.WriteAsync(bytes);
     }
 
-    private string DashboardHtml()
-    {
-        const string html = """
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Noxo Parental Control</title>
-<style>
-:root{color-scheme:dark;--bg:#070b14;--panel:#111827;--line:#263248;--text:#eef2ff;--muted:#94a3b8;--accent:#6366f1;--danger:#ef4444;--ok:#22c55e}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#070b14,#111827);color:var(--text);font-family:Segoe UI,Arial,sans-serif}
-.app{max-width:1100px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:22px}.brand{font-size:28px;font-weight:800}.muted{color:var(--muted)}
-.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.tab,button{border:0;border-radius:10px;padding:10px 14px;background:#243044;color:white;font-weight:700;cursor:pointer}.tab.active{background:var(--accent)}
-.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}.card{background:#111827ee;border:1px solid var(--line);border-radius:18px;padding:20px;margin-bottom:14px}.value{font-size:27px;font-weight:800;margin-top:7px}.ok{color:var(--ok)}.error{color:#fb7185}
-label{display:block;margin:12px 0;color:var(--muted)}input{width:100%;padding:11px;border-radius:10px;border:1px solid var(--line);background:#0b1220;color:var(--text)}.row{display:flex;gap:10px;align-items:end}.row>*{flex:1}.danger{background:var(--danger)}.notice{padding:12px;border-radius:10px;background:#182236;margin-top:12px}.item{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:10px;background:#0b1220;border-radius:10px;margin-top:8px}.toast{position:fixed;right:20px;bottom:20px;background:#182236;border:1px solid var(--line);padding:14px 18px;border-radius:12px;display:none}
-@media(max-width:650px){.app{padding:16px}.row{display:block}}
-</style>
-</head>
-<body>
-<div class="app">
-<header class="top"><div><div class="brand">Noxo Parental Control</div><div class="muted">Contrôle parental local • port __PORT__</div></div><button onclick="loadData()">Actualiser</button></header>
-<nav class="tabs">
-<button class="tab active" data-view="home">Accueil</button>
-<button class="tab" data-view="time">Temps d'écran</button>
-<button class="tab" data-view="apps">Applications</button>
-<button class="tab" data-view="security">Sécurité</button>
-<button class="tab" data-view="system">Système</button>
-</nav>
-<section id="home" class="view active"><div class="grid">
-<div class="card"><div class="muted">Agent</div><div id="agent" class="value">Connexion...</div></div>
-<div class="card"><div class="muted">Limite</div><div id="limit" class="value">—</div></div>
-<div class="card"><div class="muted">Planning</div><div id="schedule" class="value">—</div></div>
-<div class="card"><div class="muted">Applications</div><div id="count" class="value">—</div></div>
-</div><div class="card"><h2>État</h2><div id="message" class="notice">Chargement…</div></div></section>
-<section id="time" class="view"><div class="card"><h2>Temps d'écran</h2><label>Limite quotidienne (minutes)<input id="daily" type="number" min="1" max="1440"></label><div class="row"><label>Début<input id="start" type="time"></label><label>Fin<input id="end" type="time"></label></div><button onclick="saveSettings()">Enregistrer</button></div></section>
-<section id="apps" class="view"><div class="card"><h2>Applications surveillées</h2><div class="row"><label>Processus<input id="newapp" placeholder="ex: discord"></label><button onclick="addApp()">Ajouter</button></div><div id="appslist"></div></div></section>
-<section id="security" class="view"><div class="card"><h2>Sécurité</h2><label><input id="observation" type="checkbox" style="width:auto"> Mode observation</label><p class="muted">En mode observation, l'agent détecte les processus mais ne les ferme pas.</p><label>Nouveau PIN parent<input id="pin" type="password" inputmode="numeric" maxlength="12"></label><button onclick="changePin()">Changer le PIN</button></div></section>
-<section id="system" class="view"><div class="card"><h2>Système</h2><p>Version : <b id="version">—</b></p><p>Serveur : <b id="server">—</b></p><button onclick="location.reload()">Recharger</button></div></section>
-</div><div id="toast" class="toast"></div>
-<script>
-let cfg=null;
-let parentPin=sessionStorage.getItem('noxo_parent_pin')||'';
-const el=id=>document.getElementById(id);
-function toast(message){el('toast').textContent=message;el('toast').style.display='block';setTimeout(()=>el('toast').style.display='none',2500)}
-async function api(url,options={}){const headers=Object.assign({},options.headers||{});if(parentPin)headers['X-Parent-Pin']=parentPin;const response=await fetch(url,Object.assign({},options,{headers,cache:'no-store'}));const data=await response.json().catch(()=>({}));if(response.status===401){const p=prompt('PIN parent requis');if(!p)throw Error('PIN requis');parentPin=p;sessionStorage.setItem('noxo_parent_pin',p);return api(url,options)}if(!response.ok)throw Error(data.error||'Erreur serveur');return data}
-async function loadData(){try{const status=await api('/api/status');cfg=await api('/api/settings');el('agent').textContent=status.ok?'● Actif':'● Erreur';el('agent').className='value '+(status.ok?'ok':'error');el('limit').textContent=cfg.dailyLimitMinutes+' min';el('schedule').textContent=cfg.startTime+' → '+cfg.endTime;el('count').textContent=cfg.blockedApps.length;el('daily').value=cfg.dailyLimitMinutes;el('start').value=cfg.startTime;el('end').value=cfg.endTime;el('observation').checked=cfg.observationMode;el('version').textContent=status.version;el('server').textContent='127.0.0.1:'+status.port;el('message').textContent='Serveur local opérationnel.';renderApps()}catch(error){el('message').textContent=error.message;toast(error.message)}}
-async function saveSettings(){try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dailyLimitMinutes:Number(el('daily').value),startTime:el('start').value,endTime:el('end').value,observationMode:el('observation').checked,blockedApps:cfg?cfg.blockedApps:[]})});toast('Paramètres enregistrés');await loadData()}catch(error){toast(error.message)}}
-async function addApp(){const name=el('newapp').value.trim().toLowerCase();if(!name)return;const list=cfg?cfg.blockedApps.slice():[];if(list.indexOf(name)<0)list.push(name);try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dailyLimitMinutes:cfg.dailyLimitMinutes,startTime:cfg.startTime,endTime:cfg.endTime,observationMode:el('observation').checked,blockedApps:list})});el('newapp').value='';await loadData()}catch(error){toast(error.message)}}
-async function removeApp(name){const list=(cfg?cfg.blockedApps:[]).filter(x=>x!==name);try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dailyLimitMinutes:cfg.dailyLimitMinutes,startTime:cfg.startTime,endTime:cfg.endTime,observationMode:cfg.observationMode,blockedApps:list})});await loadData()}catch(error){toast(error.message)}}
-function renderApps(){const list=cfg?cfg.blockedApps:[];el('appslist').innerHTML='';if(!list.length){el('appslist').innerHTML='<p class="muted">Aucune application configurée.</p>';return}list.forEach(name=>{const item=document.createElement('div');item.className='item';const text=document.createElement('span');text.textContent=name+'.exe';const button=document.createElement('button');button.className='danger';button.textContent='Retirer';button.onclick=()=>removeApp(name);item.append(text,button);el('appslist').appendChild(item)})}
-async function changePin(){const value=el('pin').value;if(!/^\d{4,12}$/.test(value)){toast('PIN invalide');return}try{await api('/api/pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:value})});parentPin=value;sessionStorage.setItem('noxo_parent_pin',value);el('pin').value='';toast('PIN modifié')}catch(error){toast(error.message)}}
-document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));button.classList.add('active');el(button.dataset.view).classList.add('active')}));
-loadData();setInterval(loadData,10000);
-</script>
-</body>
-</html>
-""";
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
-        return html.Replace("__PORT__", port.ToString());
-    }
+    private string DashboardHtml() => $@"<!doctype html><html lang='fr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Noxo Parental Control</title><style>body{{font-family:Segoe UI,Arial;background:#080d18;color:#eef2ff;margin:0}}main{{max-width:900px;margin:auto;padding:24px}}nav{{display:flex;gap:8px;flex-wrap:wrap}}button{{background:#4f46e5;color:white;border:0;border-radius:9px;padding:10px 14px;cursor:pointer}}section{{background:#111827;border:1px solid #273449;border-radius:16px;padding:20px;margin-top:14px}}input{{background:#0b1220;color:white;border:1px solid #334155;border-radius:8px;padding:10px;margin:5px;width:calc(100% - 30px)}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}.value{{font-size:25px;font-weight:700}}.muted{{color:#94a3b8}}.danger{{background:#dc2626}}#msg{{padding:10px;background:#182236;border-radius:9px;margin-top:10px}}</style></head><body><main><h1>Noxo Parental Control</h1><p class='muted'>Serveur local • 127.0.0.1:{port}</p><nav><button onclick='load()'>Accueil</button><button onclick='save()'>Enregistrer</button><button onclick='pin()'>Modifier PIN</button></nav><section><div class='grid'><div><span class='muted'>Limite</span><div id='limit' class='value'>—</div></div><div><span class='muted'>Planning</span><div id='schedule' class='value'>—</div></div><div><span class='muted'>Applications</span><div id='count' class='value'>—</div></div></div><div id='msg'>Chargement...</div></section><section><h2>Réglages</h2><label>Minutes par jour<input id='daily' type='number' min='1' max='1440'></label><label>Début<input id='start' type='time'></label><label>Fin<input id='end' type='time'></label><label>Applications bloquées, une par ligne<textarea id='apps' style='width:calc(100% - 20px);height:120px;background:#0b1220;color:white;border:1px solid #334155;border-radius:8px;padding:10px'></textarea></label></section></main><script>let cfg=null,pinValue=sessionStorage.getItem('noxo_pin')||'';async function api(u,o={{}}){{o.headers=Object.assign({{}},o.headers||{{}},pinValue?{{'X-Parent-Pin':pinValue}}:{{}});let r=await fetch(u,Object.assign(o,{{cache:'no-store'}}));let d=await r.json().catch(()=>({{}}));if(r.status===401){{let p=prompt('PIN parent');if(!p)throw Error('PIN requis');pinValue=p;sessionStorage.setItem('noxo_pin',p);return api(u,o)}}if(!r.ok)throw Error(d.error||'Erreur');return d}}async function load(){{try{{cfg=await api('/api/settings');daily.value=cfg.dailyLimitMinutes;start.value=cfg.startTime;end.value=cfg.endTime;apps.value=cfg.blockedApps.join('\n');limit.textContent=cfg.dailyLimitMinutes+' min';schedule.textContent=cfg.startTime+' → '+cfg.endTime;count.textContent=cfg.blockedApps.length;msg.textContent='Serveur opérationnel. Version '+(await api('/api/status')).version}}catch(e){{msg.textContent=e.message}}}}async function save(){{if(!cfg)return;try{{await api('/api/settings',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dailyLimitMinutes:+daily.value,startTime:start.value,endTime:end.value,observationMode:cfg.observationMode,blockedApps:apps.value.split('\n').map(x=>x.trim()).filter(Boolean)}})}});await load()}}catch(e){{msg.textContent=e.message}}}}async function pin(){{let p=prompt('Nouveau PIN (4-12 chiffres)');if(!/^\\d{{4,12}}$/.test(p||''))return;try{{await api('/api/pin',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{pin:p}})}});pinValue=p;sessionStorage.setItem('noxo_pin',p);alert('PIN modifié')}}catch(e){{alert(e.message)}}}}load();</script></body></html>";
 
     public void Dispose()
     {
         IsRunning = false;
-        try { app?.StopAsync().GetAwaiter().GetResult(); } catch { }
-        try { app?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        app = null;
+        try { cts?.Cancel(); } catch { }
+        try { listener?.Stop(); } catch { }
+        cts?.Dispose();
+        listener = null;
     }
 
     private sealed class SettingsDto
@@ -245,14 +220,6 @@ loadData();setInterval(loadData,10000);
         public List<string>? BlockedApps { get; set; }
     }
 
-    private sealed class PinDto
-    {
-        public string? Pin { get; set; }
-    }
-
-    private sealed class AgentEvent
-    {
-        public string? Type { get; set; }
-        public string? Message { get; set; }
-    }
+    private sealed class PinDto { public string? Pin { get; set; } }
+    private sealed class AgentEvent { public string? Type { get; set; } public string? Message { get; set; } }
 }
