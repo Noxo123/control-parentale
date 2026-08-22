@@ -58,4 +58,10 @@ record AgentConfig(
     string Start_Time,
     string End_Time,
     List<string> Blocked_Apps
-);
+)
+{
+    public int DailyLimitMinutes => Daily_Limit_Minutes;
+    public string StartTime => Start_Time;
+    public string EndTime => End_Time;
+    public List<string> BlockedApps => Blocked_Apps ?? new List<string>();
+}
