@@ -20,7 +20,7 @@ internal static class Program
         Application.Run(new NoxoForm());
     }
 
-    private static void WriteCrash(Exception ex)
+    internal static void WriteCrash(Exception ex)
     {
         try
         {
@@ -70,24 +70,19 @@ internal sealed class NoxoForm : ProtonForm
             webView = new ProtonWebView(this) { Dock = DockStyle.Fill, AllowResizable = true };
             Controls.Add(webView);
 
-            var userDataFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "NoxoParental", "WebView2");
+            var userDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NoxoParental", "WebView2");
             Directory.CreateDirectory(userDataFolder);
 
             var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
             await webView.EnsureCoreWebView2Async(environment);
             webView.DefaultBackgroundColor = Color.Transparent;
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-            webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                "noxo.local",
-                Path.Combine(AppContext.BaseDirectory, "wwwroot"),
-                CoreWebView2HostResourceAccessKind.Allow);
+            webView.CoreWebView2.SetVirtualHostNameToFolderMapping("noxo.local", Path.Combine(AppContext.BaseDirectory, "wwwroot"), CoreWebView2HostResourceAccessKind.Allow);
             webView.CoreWebView2.Navigate("https://noxo.local/index.html");
         }
         catch (Exception ex)
         {
-            Program.WriteCrashForUi(ex);
+            Program.WriteCrash(ex);
             ShowError("L'interface web n'a pas pu démarrer.\n\n" + ex.Message);
         }
     }
