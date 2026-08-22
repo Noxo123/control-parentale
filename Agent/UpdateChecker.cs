@@ -10,39 +10,37 @@ public sealed record GitHubRelease(string? tag_name, string? html_url, string? n
 public static class UpdateChecker
 {
     private const string ReleaseApi = "https://api.github.com/repos/Noxo123/control-parentale/releases/latest";
-    private const string TagsApi = "https://api.github.com/repos/Noxo123/control-parentale/tags?per_page=10";
-    private static readonly Version FallbackVersion = new(1, 0, 6);
+    private const string TagsApi = "https://api.github.com/repos/Noxo123/control-parentale/tags?per_page=20";
+    private static readonly Version FallbackVersion = new(1, 0, 7);
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public static async Task<GitHubRelease?> CheckAsync(HttpClient http, CancellationToken cancellationToken = default)
     {
         try
         {
-            var release = await GetJsonAsync<GitHubRelease>(http, ReleaseApi, cancellationToken);
-            if (release?.tag_name is not null) return release;
+            using var response = await SendAsync(http, ReleaseApi, cancellationToken);
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                var release = JsonSerializer.Deserialize<GitHubRelease>(json, JsonOptions);
+                if (release?.tag_name is not null && ParseTag(release.tag_name) is not null) return release;
+            }
 
-            // The repository may have tags but no GitHub Release yet.
-            using var response = await SendAsync(http, TagsApi, cancellationToken);
-            if (!response.IsSuccessStatusCode) return null;
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            var tags = JsonSerializer.Deserialize<List<GitHubTag>>(json, JsonOptions) ?? [];
-            var newest = tags.Select(x => new { Tag = x.name, Version = ParseTag(x.name) })
+            using var tagsResponse = await SendAsync(http, TagsApi, cancellationToken);
+            if (!tagsResponse.IsSuccessStatusCode) return null;
+            var tagsJson = await tagsResponse.Content.ReadAsStringAsync(cancellationToken);
+            var tags = JsonSerializer.Deserialize<List<GitHubTag>>(tagsJson, JsonOptions) ?? [];
+            var newest = tags
+                .Select(x => new { Tag = x.name, Version = ParseTag(x.name) })
                 .Where(x => x.Version is not null)
                 .OrderByDescending(x => x.Version)
                 .FirstOrDefault();
-            return newest is null ? null : new GitHubRelease(newest.Tag, "https://github.com/Noxo123/control-parentale/releases", newest.Tag, null);
+            return newest is null
+                ? null
+                : new GitHubRelease(newest.Tag, "https://github.com/Noxo123/control-parentale/releases", newest.Tag, null);
         }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static async Task<T?> GetJsonAsync<T>(HttpClient http, string url, CancellationToken cancellationToken)
-    {
-        using var response = await SendAsync(http, url, cancellationToken);
-        if (!response.IsSuccessStatusCode) return default;
-        var json = await response.Content.ReadAsStringAsync(cancellationToken);
-        return string.IsNullOrWhiteSpace(json) ? default : JsonSerializer.Deserialize<T>(json, JsonOptions);
+        catch (OperationCanceledException) { return null; }
+        catch { return null; }
     }
 
     private static async Task<HttpResponseMessage> SendAsync(HttpClient http, string url, CancellationToken cancellationToken)
@@ -90,5 +88,4 @@ public static class UpdateChecker
     }
 
     private sealed record GitHubTag(string? name);
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 }
