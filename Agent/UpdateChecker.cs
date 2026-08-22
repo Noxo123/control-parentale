@@ -14,9 +14,16 @@ public static class UpdateChecker
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, ReleaseApi);
         request.Headers.UserAgent.ParseAdd("NoxoParental/1.0");
+        request.Headers.Accept.ParseAdd("application/vnd.github+json");
+
         using var response = await http.SendAsync(request);
         if (!response.IsSuccessStatusCode) return null;
-        return await response.Content.ReadFromJsonAsync<GitHubRelease>();
+
+        var json = await response.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        return JsonSerializer.Deserialize<GitHubRelease>(json,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
     }
 
     public static Version CurrentVersion => Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0, 0);
@@ -30,6 +37,10 @@ public static class UpdateChecker
 
     public static void OpenRelease(string url)
     {
-        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+            return;
+
+        Process.Start(new ProcessStartInfo { FileName = uri.AbsoluteUri, UseShellExecute = true });
     }
 }
