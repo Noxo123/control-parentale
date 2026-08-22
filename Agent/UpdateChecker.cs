@@ -10,7 +10,7 @@ public sealed record GitHubRelease(string? tag_name, string? html_url, string? n
 public static class UpdateChecker
 {
     private const string ReleaseApi = "https://api.github.com/repos/Noxo123/control-parentale/releases/latest";
-    private static readonly Version FallbackVersion = new(1, 0, 3);
+    private static readonly Version FallbackVersion = new(1, 0, 4);
 
     public static async Task<GitHubRelease?> CheckAsync(HttpClient http, CancellationToken cancellationToken = default)
     {
