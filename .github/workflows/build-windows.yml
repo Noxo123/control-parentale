@@ -3,10 +3,11 @@ name: Build Windows EXE
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-windows:
@@ -29,15 +30,27 @@ jobs:
       - name: Verify EXE
         shell: pwsh
         run: |
-          if (-not (Test-Path "publish/NoxoParental.exe")) {
-            Write-Error "NoxoParental.exe introuvable après le publish."
-            exit 1
-          }
-          Get-Item "publish/NoxoParental.exe" | Select-Object Name, Length, FullName
+          $exe = Get-Item "publish/NoxoParental.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { Write-Error "NoxoParental.exe introuvable après le publish."; exit 1 }
+          Write-Host "EXE: $($exe.FullName) - $($exe.Length) bytes"
 
-      - name: Upload EXE
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: NoxoParental-Windows-x64
           path: publish/NoxoParental.exe
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag publish/NoxoParental.exe --repo "${{ github.repository }}" --title "Noxo Parental $tag" --generate-notes
+          } else {
+            gh release upload $tag publish/NoxoParental.exe --repo "${{ github.repository }}" --clobber
+          }
