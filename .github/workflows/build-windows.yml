@@ -16,17 +16,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET
+      - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      - name: Publish Agent
+      - name: Verify project
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore Agent/NoxoParental.csproj
+
+      - name: Build and publish EXE
         run: dotnet publish Agent/NoxoParental.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 
-      - name: Rename EXE
+      - name: Verify EXE
         shell: pwsh
-        run: Rename-Item publish/NoxoParental.exe NoxoParental.exe
+        run: |
+          if (-not (Test-Path "publish/NoxoParental.exe")) {
+            Write-Error "NoxoParental.exe introuvable après le publish."
+            exit 1
+          }
+          Get-Item "publish/NoxoParental.exe" | Select-Object Name, Length, FullName
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
