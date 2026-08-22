@@ -8,195 +8,353 @@ namespace NoxoParental;
 internal static class Program
 {
     [STAThread]
-    static void Main()
+    private static void Main()
     {
         ApplicationConfiguration.Initialize();
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => LogFatal(e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            if (e.ExceptionObject is Exception ex) LogFatal(ex);
+        };
         Application.Run(new MainForm());
+    }
+
+    private static void LogFatal(Exception ex)
+    {
+        try
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NoxoParental");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "crash.log"), $"[{DateTime.Now:O}] {ex}\r\n");
+        }
+        catch { }
     }
 }
 
 public sealed class MainForm : Form
 {
     private const int DefaultPort = 20570;
-    private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(3) };
+    private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(2) };
     private readonly SettingsStore settings = new();
+    private readonly System.Windows.Forms.Timer statusTimer = new() { Interval = 30000 };
+    private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 6 * 60 * 60 * 1000 };
+    private readonly CancellationTokenSource lifetime = new();
     private readonly Label status = new();
     private readonly Label server = new();
     private readonly Label activity = new();
     private readonly Label update = new();
-    private readonly Label version = new();
     private readonly Label portLabel = new();
     private readonly ListBox events = new();
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 15000 };
     private LocalServer? localServer;
-    private bool checking;
-    private bool checkingUpdate;
     private int port = DefaultPort;
+    private int busy;
+    private bool closing;
 
     public MainForm()
     {
         Text = "Noxo Parental Control";
-        Width = 900; Height = 650;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(760, 560);
-        BackColor = Color.FromArgb(10, 15, 27);
+        ClientSize = new Size(940, 620);
+        MinimumSize = new Size(820, 560);
+        BackColor = Color.FromArgb(9, 13, 24);
         ForeColor = Color.White;
+        Font = new Font("Segoe UI", 9F);
+        DoubleBuffered = true;
 
-        var title = new Label { Text = "Noxo Parental Control", Font = new Font("Segoe UI", 23, FontStyle.Bold), AutoSize = true, Location = new Point(30, 24), ForeColor = Color.White };
-        var subtitle = new Label { Text = "Contrôle parental Windows • sécurisé • local", ForeColor = Color.FromArgb(148, 163, 184), AutoSize = true, Location = new Point(33, 65) };
-
-        ConfigureStatus(status, "● Démarrage", 30, 108);
-        ConfigureStatus(server, "Serveur : démarrage…", 30, 140);
-        ConfigureStatus(activity, "Règles : chargement…", 30, 172);
-        ConfigureStatus(update, "Mises à jour : vérification…", 30, 204);
-
-        var dashboard = Button("Ouvrir le dashboard", 30, 245, 170, 42);
-        dashboard.Click += (_, _) => OpenDashboard();
-        var refresh = Button("Actualiser", 212, 245, 110, 42);
-        refresh.Click += async (_, _) => await SafeRefresh();
-        var updates = Button("Mises à jour", 334, 245, 125, 42);
-        updates.Click += async (_, _) => await CheckForUpdate(true);
-        var restart = Button("Relancer le serveur", 471, 245, 155, 42);
-        restart.Click += async (_, _) => await RestartServer();
-
-        var security = new Label { Text = "🔒 Dashboard local • modifications protégées par PIN parent", AutoSize = true, ForeColor = Color.FromArgb(148, 163, 184), Location = new Point(30, 300) };
-
-        events.Location = new Point(30, 335); events.Size = new Size(820, 235); events.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        events.BackColor = Color.FromArgb(17, 24, 39); events.ForeColor = Color.FromArgb(226, 232, 240); events.BorderStyle = BorderStyle.FixedSingle;
-
-        version.Text = "Version : " + UpdateChecker.CurrentVersion.ToString(3); version.AutoSize = true; version.ForeColor = Color.FromArgb(148, 163, 184); version.Location = new Point(30, 585); version.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
-        portLabel.Text = "Port : —"; portLabel.AutoSize = true; portLabel.ForeColor = Color.FromArgb(148, 163, 184); portLabel.Location = new Point(160, 585); portLabel.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
-
-        Controls.AddRange([title, subtitle, status, server, activity, update, dashboard, refresh, updates, restart, security, events, version, portLabel]);
-        Shown += async (_, _) => await SafeRefresh();
-        timer.Tick += async (_, _) => await SafeRefresh();
-        timer.Start();
+        BuildInterface();
+        Shown += async (_, _) => await StartupAsync();
+        statusTimer.Tick += async (_, _) => await RefreshStatusAsync();
+        updateTimer.Tick += async (_, _) => await CheckUpdateAsync(false);
+        FormClosing += (_, _) => closing = true;
+        FormClosed += (_, _) => Shutdown();
     }
 
-    private static void ConfigureStatus(Label label, string text, int x, int y)
+    private void BuildInterface()
     {
-        label.Text = text; label.AutoSize = true; label.Location = new Point(x, y); label.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+        var sidebar = new Panel { Dock = DockStyle.Left, Width = 210, BackColor = Color.FromArgb(14, 20, 34), Padding = new Padding(18) };
+        var brand = new Label { Text = "NOXO\nPARENTAL", Dock = DockStyle.Top, Height = 70, Font = new Font("Segoe UI", 15, FontStyle.Bold), ForeColor = Color.White };
+        sidebar.Controls.Add(brand);
+
+        var nav = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 245, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Color.Transparent };
+        nav.Controls.Add(NavButton("⌂  Accueil", true, () => ShowHome()));
+        nav.Controls.Add(NavButton("◷  Temps d'écran", false, OpenDashboard));
+        nav.Controls.Add(NavButton("▣  Applications", false, OpenDashboard));
+        nav.Controls.Add(NavButton("⚙  Paramètres", false, OpenDashboard));
+        sidebar.Controls.Add(nav);
+
+        var sideStatus = new Label { Dock = DockStyle.Bottom, Height = 80, ForeColor = Color.FromArgb(148, 163, 184), Text = "Agent local\nDémarrage…", Padding = new Padding(0, 8, 0, 0) };
+        sidebar.Controls.Add(sideStatus);
+
+        var content = new Panel { Dock = DockStyle.Fill, Padding = new Padding(28), BackColor = Color.FromArgb(9, 13, 24) };
+        var title = new Label { Text = "Vue d'ensemble", Dock = DockStyle.Top, Height = 46, Font = new Font("Segoe UI", 22, FontStyle.Bold), ForeColor = Color.White };
+        content.Controls.Add(title);
+
+        var subtitle = new Label { Text = "Contrôle parental simple, local et léger", Dock = DockStyle.Top, Height = 34, ForeColor = Color.FromArgb(148, 163, 184) };
+        content.Controls.Add(subtitle);
+
+        var cards = new TableLayoutPanel { Dock = DockStyle.Top, Height = 132, ColumnCount = 3, RowCount = 1, Padding = new Padding(0, 8, 0, 8) };
+        cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+        cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+        cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
+        cards.Controls.Add(Card("État", status, 0), 0, 0);
+        cards.Controls.Add(Card("Serveur", server, 1), 1, 0);
+        cards.Controls.Add(Card("Règles", activity, 2), 2, 0);
+        content.Controls.Add(cards);
+
+        var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 62, WrapContents = false, Padding = new Padding(0, 8, 0, 8) };
+        actions.Controls.Add(ActionButton("Ouvrir le contrôle", OpenDashboard, true));
+        actions.Controls.Add(ActionButton("Actualiser", async () => await RefreshStatusAsync(), false));
+        actions.Controls.Add(ActionButton("Mise à jour", async () => await CheckUpdateAsync(true), false));
+        actions.Controls.Add(ActionButton("Redémarrer le service", async () => await RestartServerAsync(), false));
+        content.Controls.Add(actions);
+
+        var updatePanel = new Panel { Dock = DockStyle.Top, Height = 42, BackColor = Color.FromArgb(14, 20, 34), Padding = new Padding(12, 8, 12, 8) };
+        update.Text = "Mises à jour : vérification…";
+        update.Dock = DockStyle.Fill;
+        update.ForeColor = Color.FromArgb(148, 163, 184);
+        updatePanel.Controls.Add(update);
+        content.Controls.Add(updatePanel);
+
+        events.Dock = DockStyle.Fill;
+        events.BackColor = Color.FromArgb(14, 20, 34);
+        events.ForeColor = Color.FromArgb(226, 232, 240);
+        events.BorderStyle = BorderStyle.None;
+        events.IntegralHeight = false;
+        events.HorizontalScrollbar = false;
+        content.Controls.Add(events);
+
+        var footer = new Panel { Dock = DockStyle.Bottom, Height = 30 };
+        portLabel.Text = "Port : —";
+        portLabel.Dock = DockStyle.Left;
+        portLabel.ForeColor = Color.FromArgb(100, 116, 139);
+        footer.Controls.Add(portLabel);
+        var version = new Label { Text = $"v{UpdateChecker.CurrentVersion.ToString(3)}", Dock = DockStyle.Right, ForeColor = Color.FromArgb(100, 116, 139), TextAlign = ContentAlignment.MiddleRight };
+        footer.Controls.Add(version);
+        content.Controls.Add(footer);
+
+        Controls.Add(content);
+        Controls.Add(sidebar);
     }
 
-    private static Button Button(string text, int x, int y, int width, int height) => new()
+    private static Panel Card(string caption, Label value, int index)
     {
-        Text = text, Location = new Point(x, y), Size = new Size(width, height), FlatStyle = FlatStyle.Flat,
-        BackColor = Color.FromArgb(79, 70, 229), ForeColor = Color.White, Font = new Font("Segoe UI", 9, FontStyle.Bold), Cursor = Cursors.Hand
-    };
+        var p = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 10, 0), BackColor = Color.FromArgb(17, 24, 39), Padding = new Padding(14) };
+        var c = new Label { Text = caption, Dock = DockStyle.Top, Height = 25, ForeColor = Color.FromArgb(148, 163, 184) };
+        value.Dock = DockStyle.Fill;
+        value.Text = "…";
+        value.Font = new Font("Segoe UI", 11, FontStyle.Bold);
+        value.ForeColor = Color.White;
+        p.Controls.Add(value);
+        p.Controls.Add(c);
+        return p;
+    }
 
-    private async Task SafeRefresh()
+    private static Button NavButton(string text, bool selected, Action action)
+    {
+        var b = new Button { Text = text, Width = 174, Height = 42, Margin = new Padding(0, 2, 0, 2), FlatStyle = FlatStyle.Flat, FlatAppearance = { BorderSize = 0 }, BackColor = selected ? Color.FromArgb(79, 70, 229) : Color.Transparent, ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 0, 0), Cursor = Cursors.Hand };
+        b.Click += (_, _) => SafeUi(action);
+        return b;
+    }
+
+    private static Button ActionButton(string text, Action action, bool primary)
+    {
+        var b = new Button { Text = text, Width = primary ? 165 : 140, Height = 42, Margin = new Padding(0, 0, 8, 0), FlatStyle = FlatStyle.Flat, FlatAppearance = { BorderSize = 0 }, BackColor = primary ? Color.FromArgb(79, 70, 229) : Color.FromArgb(30, 41, 59), ForeColor = Color.White, Cursor = Cursors.Hand };
+        b.Click += (_, _) => SafeUi(action);
+        return b;
+    }
+
+    private static void SafeUi(Action action)
+    {
+        try { action(); } catch { }
+    }
+
+    private async Task StartupAsync()
     {
         try
         {
-            StartLocalServer(false);
-            await CheckServer();
-            await CheckForUpdate(false);
+            status.Text = "Démarrage…";
+            AddEvent("system", "Initialisation de l'agent…");
+            await Task.Run(StartLocalServer, lifetime.Token);
+            await RefreshStatusAsync();
+            await CheckUpdateAsync(false);
+            statusTimer.Start();
+            updateTimer.Start();
+            AddEvent("system", "Agent prêt.");
         }
         catch (Exception ex)
         {
-            AddEvent("error", ex.Message);
+            status.Text = "Agent limité";
+            status.ForeColor = Color.FromArgb(251, 146, 60);
+            AddEvent("error", "Démarrage : " + ex.Message);
         }
     }
 
-    private async Task RestartServer()
+    private void StartLocalServer()
     {
-        try
-        {
-            localServer?.Dispose();
-            localServer = null;
-            await Task.Delay(150);
-            StartLocalServer(true);
-            await CheckServer();
-        }
-        catch (Exception ex) { AddEvent("error", "Redémarrage : " + ex.Message); }
-    }
-
-    private void StartLocalServer(bool forceRestart)
-    {
-        if (forceRestart) { localServer?.Dispose(); localServer = null; }
         if (localServer?.IsRunning == true) return;
-
         for (var candidate = DefaultPort; candidate <= DefaultPort + 20; candidate++)
         {
+            if (closing) return;
             var candidateServer = new LocalServer(candidate, settings, AddEvent);
             candidateServer.Start();
             if (candidateServer.IsRunning)
             {
                 localServer = candidateServer;
                 port = candidate;
-                portLabel.Text = $"Port : {port}";
+                BeginUi(() => portLabel.Text = $"Port local : {port}");
                 return;
             }
             candidateServer.Dispose();
         }
-        throw new InvalidOperationException("Impossible d'ouvrir un port local disponible.");
+        throw new InvalidOperationException("Aucun port local disponible.");
     }
 
-    private async Task CheckServer()
+    private async Task RefreshStatusAsync()
     {
-        if (checking || IsDisposed) return;
-        checking = true;
+        if (closing || Interlocked.Exchange(ref busy, 1) != 0) return;
         try
         {
-            if (localServer?.IsRunning != true) StartLocalServer(false);
-            using var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config");
+            await Task.Run(StartLocalServer, lifetime.Token);
+            using var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config", lifetime.Token);
             response.EnsureSuccessStatusCode();
-            var config = await response.Content.ReadFromJsonAsync<AgentConfig>();
-            status.Text = "● Agent actif"; status.ForeColor = Color.FromArgb(74, 222, 128);
-            server.Text = $"Serveur : connecté sur 127.0.0.1:{port}"; server.ForeColor = Color.FromArgb(74, 222, 128);
-            if (config != null) activity.Text = $"Règles : {config.BlockedApps.Count} application(s) • {config.DailyLimitMinutes} min/jour • {config.StartTime} → {config.EndTime}";
+            var config = await response.Content.ReadFromJsonAsync<AgentConfig>(cancellationToken: lifetime.Token);
+            BeginUi(() =>
+            {
+                status.Text = "● Agent actif";
+                status.ForeColor = Color.FromArgb(74, 222, 128);
+                server.Text = $"127.0.0.1:{port}";
+                server.ForeColor = Color.FromArgb(74, 222, 128);
+                if (config != null) activity.Text = $"{config.BlockedApps.Count} app. • {config.DailyLimitMinutes} min/jour";
+            });
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            status.Text = "● Agent en attente"; status.ForeColor = Color.FromArgb(251, 146, 60);
-            server.Text = "Serveur : reconnexion automatique…"; server.ForeColor = Color.FromArgb(251, 146, 60);
-            activity.Text = "Le serveur intégré sera relancé automatiquement.";
+            BeginUi(() =>
+            {
+                status.Text = "● En attente";
+                status.ForeColor = Color.FromArgb(251, 146, 60);
+                server.Text = "Reconnexion automatique";
+                activity.Text = "Serveur local en cours de récupération";
+            });
             AddEvent("server", ex.Message);
         }
-        finally { checking = false; }
+        finally { Interlocked.Exchange(ref busy, 0); }
+    }
+
+    private async Task RestartServerAsync()
+    {
+        if (Interlocked.Exchange(ref busy, 1) != 0) return;
+        try
+        {
+            AddEvent("server", "Redémarrage du serveur local…");
+            await Task.Run(() =>
+            {
+                localServer?.Dispose();
+                localServer = null;
+                Thread.Sleep(100);
+                StartLocalServer();
+            }, lifetime.Token);
+            await RefreshStatusCoreAsync();
+        }
+        catch (Exception ex) { AddEvent("error", "Redémarrage : " + ex.Message); }
+        finally { Interlocked.Exchange(ref busy, 0); }
+    }
+
+    private async Task RefreshStatusCoreAsync()
+    {
+        try
+        {
+            using var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config", lifetime.Token);
+            response.EnsureSuccessStatusCode();
+            BeginUi(() => { status.Text = "● Agent actif"; status.ForeColor = Color.FromArgb(74, 222, 128); server.Text = $"127.0.0.1:{port}"; });
+        }
+        catch (Exception ex) { AddEvent("server", ex.Message); }
     }
 
     private void OpenDashboard()
     {
         try
         {
-            StartLocalServer(false);
-            Process.Start(new ProcessStartInfo { FileName = $"http://127.0.0.1:{port}/", UseShellExecute = true });
+            StartLocalServer();
+            Process.Start(new ProcessStartInfo($"http://127.0.0.1:{port}/") { UseShellExecute = true });
         }
-        catch (Exception ex) { AddEvent("error", ex.Message); MessageBox.Show(this, "Impossible d'ouvrir le dashboard.\n" + ex.Message, "Noxo Parental Control", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        catch (Exception ex) { AddEvent("error", "Dashboard : " + ex.Message); }
+    }
+
+    private async Task CheckUpdateAsync(bool interactive)
+    {
+        try
+        {
+            update.Text = "Mises à jour : vérification…";
+            var release = await UpdateChecker.CheckAsync(http, lifetime.Token);
+            if (release is null)
+            {
+                update.Text = "Mises à jour : vérification impossible (hors ligne ou aucune release)";
+                update.ForeColor = Color.FromArgb(148, 163, 184);
+                return;
+            }
+            if (UpdateChecker.IsNewer(release.tag_name, out _))
+            {
+                update.Text = $"● Mise à jour disponible : {release.tag_name}";
+                update.ForeColor = Color.FromArgb(251, 146, 60);
+                if (interactive) UpdateChecker.OpenRelease(release.html_url);
+            }
+            else
+            {
+                update.Text = $"● Application à jour • v{UpdateChecker.CurrentVersion.ToString(3)}";
+                update.ForeColor = Color.FromArgb(74, 222, 128);
+            }
+        }
+        catch (Exception ex) { AddEvent("update", ex.Message); }
     }
 
     private void AddEvent(string type, string message)
     {
-        if (IsDisposed) return;
-        if (InvokeRequired) { BeginInvoke(() => AddEvent(type, message)); return; }
-        events.Items.Insert(0, $"{DateTime.Now:T} • [{type}] {message}");
-        while (events.Items.Count > 100) events.Items.RemoveAt(events.Items.Count - 1);
-    }
-
-    private async Task CheckForUpdate(bool interactive)
-    {
-        if (checkingUpdate) return;
-        checkingUpdate = true;
+        if (closing || IsDisposed || Disposing) return;
+        var text = $"{DateTime.Now:HH:mm:ss}  {type.ToUpperInvariant()}  {message}";
         try
         {
-            var release = await UpdateChecker.CheckAsync(http);
-            if (release is null) { update.Text = "Mises à jour : GitHub indisponible"; update.ForeColor = Color.Gray; return; }
-            if (UpdateChecker.IsNewer(release.tag_name, out _))
+            if (InvokeRequired)
             {
-                update.Text = $"🟠 Nouvelle version : {release.tag_name}"; update.ForeColor = Color.FromArgb(251, 146, 60);
-                if (interactive && MessageBox.Show(this, $"La version {release.tag_name} est disponible. Ouvrir GitHub ?", "Mise à jour", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes) UpdateChecker.OpenRelease(release.html_url);
+                BeginInvoke((MethodInvoker)(() => AddEvent(type, message)));
+                return;
             }
-            else { update.Text = $"Mises à jour : {UpdateChecker.CurrentVersion.ToString(3)} à jour"; update.ForeColor = Color.FromArgb(74, 222, 128); }
+            events.Items.Insert(0, text);
+            while (events.Items.Count > 80) events.Items.RemoveAt(events.Items.Count - 1);
         }
-        catch (Exception ex) { update.Text = "Mises à jour : erreur de vérification"; AddEvent("update", ex.Message); }
-        finally { checkingUpdate = false; }
+        catch { }
+    }
+
+    private void BeginUi(Action action)
+    {
+        if (closing || IsDisposed || Disposing) return;
+        try
+        {
+            if (InvokeRequired) BeginInvoke((MethodInvoker)(() => BeginUi(action)));
+            else action();
+        }
+        catch { }
+    }
+
+    private void ShowHome() { }
+
+    private void Shutdown()
+    {
+        closing = true;
+        try { statusTimer.Stop(); updateTimer.Stop(); } catch { }
+        try { lifetime.Cancel(); } catch { }
+        try { localServer?.Dispose(); } catch { }
+        try { http.Dispose(); } catch { }
+        lifetime.Dispose();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        timer.Stop(); localServer?.Dispose(); http.Dispose(); base.OnFormClosed(e);
+        Shutdown();
+        base.OnFormClosed(e);
     }
 }
 
