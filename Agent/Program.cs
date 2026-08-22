@@ -17,15 +17,16 @@ internal static class Program
 public sealed class MainForm : Form
 {
     private const int DefaultPort = 20570;
-    private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(4) };
+    private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(5) };
     private readonly Label status = new();
     private readonly Label server = new();
     private readonly Label activity = new();
     private readonly Label update = new();
     private readonly ListBox events = new();
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 10000 };
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 15000 };
     private LocalServer? localServer;
     private bool checking;
+    private bool checkingUpdate;
     private int port = DefaultPort;
 
     public MainForm()
@@ -36,14 +37,14 @@ public sealed class MainForm : Form
         MinimumSize = new Size(720, 500);
 
         var title = new Label { Text = "Noxo Parental Control", Font = new Font("Segoe UI", 22, FontStyle.Bold), AutoSize = true, Location = new Point(28, 22) };
-        var subtitle = new Label { Text = "Agent Windows • serveur local intégré • mises à jour GitHub", ForeColor = Color.DimGray, AutoSize = true, Location = new Point(31, 62) };
+        var subtitle = new Label { Text = "Agent Windows • serveur web intégré • mises à jour GitHub", ForeColor = Color.DimGray, AutoSize = true, Location = new Point(31, 62) };
         status.Text = "● Démarrage"; status.AutoSize = true; status.Font = new Font("Segoe UI", 11, FontStyle.Bold); status.Location = new Point(30, 105);
         server.Text = "Serveur : démarrage…"; server.AutoSize = true; server.Location = new Point(30, 135);
         activity.Text = "Règles : chargement…"; activity.AutoSize = true; activity.Location = new Point(30, 165);
         update.Text = "Mises à jour : vérification…"; update.AutoSize = true; update.Location = new Point(30, 190);
 
-        var retry = new Button { Text = "Vérifier le serveur", AutoSize = true, Location = new Point(30, 225) };
-        retry.Click += async (_, _) => await CheckServer();
+        var retry = new Button { Text = "Relancer le serveur", AutoSize = true, Location = new Point(30, 225) };
+        retry.Click += async (_, _) => { StartLocalServer(true); await CheckServer(); };
         var openDashboard = new Button { Text = "Ouvrir le dashboard", AutoSize = true, Location = new Point(180, 225) };
         openDashboard.Click += (_, _) => OpenUrl($"http://127.0.0.1:{port}/");
         var checkUpdate = new Button { Text = "Vérifier les mises à jour", AutoSize = true, Location = new Point(350, 225) };
@@ -52,15 +53,22 @@ public sealed class MainForm : Form
         events.Location = new Point(30, 275); events.Size = new Size(720, 220); events.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         Controls.AddRange([title, subtitle, status, server, activity, update, retry, openDashboard, checkUpdate, events]);
 
-        StartLocalServer();
-        Shown += async (_, _) => { await CheckServer(); await CheckForUpdate(false); };
+        Shown += async (_, _) => { StartLocalServer(false); await CheckServer(); await CheckForUpdate(false); };
         timer.Tick += async (_, _) => { await CheckServer(); await CheckForUpdate(false); };
         timer.Start();
     }
 
-    private void StartLocalServer()
+    private void StartLocalServer(bool forceRestart)
     {
-        for (var candidate = DefaultPort; candidate <= DefaultPort + 10; candidate++)
+        if (forceRestart)
+        {
+            localServer?.Dispose();
+            localServer = null;
+        }
+
+        if (localServer?.IsRunning == true) return;
+
+        for (var candidate = DefaultPort; candidate <= DefaultPort + 20; candidate++)
         {
             var candidateServer = new LocalServer(candidate, GetConfig, AddEvent);
             candidateServer.Start();
@@ -68,13 +76,13 @@ public sealed class MainForm : Form
             {
                 localServer = candidateServer;
                 port = candidate;
-                AddEvent("server", $"Serveur disponible sur 127.0.0.1:{port}");
+                AddEvent("server", $"Serveur web disponible : {localServer.Url}");
                 return;
             }
             candidateServer.Dispose();
         }
 
-        AddEvent("error", $"Impossible d'ouvrir les ports {DefaultPort}-{DefaultPort + 10}.");
+        AddEvent("error", $"Impossible d'ouvrir un port libre entre {DefaultPort} et {DefaultPort + 20}.");
     }
 
     private object GetConfig() => new
@@ -91,10 +99,11 @@ public sealed class MainForm : Form
         checking = true;
         try
         {
+            StartLocalServer(false);
             if (localServer is null || !localServer.IsRunning)
-                StartLocalServer();
+                throw new InvalidOperationException("Le serveur web intégré n'est pas démarré.");
 
-            var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config");
+            using var response = await http.GetAsync($"http://127.0.0.1:{port}/api/agent-config");
             response.EnsureSuccessStatusCode();
             var config = await response.Content.ReadFromJsonAsync<AgentConfig>();
             status.Text = "● Agent actif"; status.ForeColor = Color.ForestGreen;
@@ -106,7 +115,7 @@ public sealed class MainForm : Form
         {
             status.Text = "● Agent en attente"; status.ForeColor = Color.DarkOrange;
             server.Text = $"Serveur : indisponible ({ex.Message})"; server.ForeColor = Color.DarkOrange;
-            activity.Text = "Le serveur local intégré n'a pas pu répondre.";
+            activity.Text = "Relance automatique du serveur au prochain contrôle.";
         }
         finally { checking = false; }
     }
@@ -121,23 +130,36 @@ public sealed class MainForm : Form
 
     private async Task CheckForUpdate(bool interactive)
     {
+        if (checkingUpdate) return;
+        checkingUpdate = true;
         try
         {
             var release = await UpdateChecker.CheckAsync(http);
-            var latest = UpdateChecker.ParseTag(release?.tag_name);
-            var current = UpdateChecker.CurrentVersion;
-            if (latest != null && latest > current)
+            if (release is null)
             {
-                update.Text = $"Mise à jour disponible : {release!.tag_name}"; update.ForeColor = Color.DarkOrange;
-                if (interactive && MessageBox.Show($"Une nouvelle version ({release.tag_name}) est disponible. Ouvrir GitHub ?", "Mise à jour", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                update.Text = "Mises à jour : GitHub indisponible"; update.ForeColor = Color.DimGray;
+                return;
+            }
+
+            if (UpdateChecker.IsNewer(release.tag_name, out var latest))
+            {
+                update.Text = $"Mise à jour disponible : {release.tag_name} (actuelle {UpdateChecker.CurrentVersion.ToString(3)})";
+                update.ForeColor = Color.DarkOrange;
+                if (interactive && MessageBox.Show($"Une nouvelle version ({release.tag_name}) est disponible. Ouvrir la page de téléchargement ?", "Mise à jour", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
                     UpdateChecker.OpenRelease(release.html_url);
             }
             else
             {
-                update.Text = "Mises à jour : dernière version"; update.ForeColor = Color.ForestGreen;
+                update.Text = $"Mises à jour : version {UpdateChecker.CurrentVersion.ToString(3)} à jour";
+                update.ForeColor = Color.ForestGreen;
             }
         }
-        catch { update.Text = "Mises à jour : vérification impossible"; update.ForeColor = Color.DimGray; }
+        catch (Exception ex)
+        {
+            update.Text = "Mises à jour : vérification impossible"; update.ForeColor = Color.DimGray;
+            AddEvent("update", $"Vérification GitHub : {ex.Message}");
+        }
+        finally { checkingUpdate = false; }
     }
 
     private static void OpenUrl(string url) => Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
