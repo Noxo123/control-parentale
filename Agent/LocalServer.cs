@@ -1,114 +1,154 @@
-using System.Net;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 namespace NoxoParental;
 
 public sealed class LocalServer : IDisposable
 {
-    private readonly HttpListener listener = new();
+    private WebApplication? app;
     private readonly int port;
     private readonly Func<object> config;
     private readonly Action<string, string> log;
-    private CancellationTokenSource? cts;
 
     public LocalServer(int port, Func<object> config, Action<string, string> log)
     {
         this.port = port;
         this.config = config;
         this.log = log;
-        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
     }
 
-    public bool IsRunning => listener.IsListening;
+    public bool IsRunning { get; private set; }
+    public int Port => port;
+    public string Url => $"http://127.0.0.1:{port}";
 
     public void Start()
     {
-        if (listener.IsListening) return;
-        cts = new CancellationTokenSource();
+        if (IsRunning) return;
+
         try
         {
-            listener.Start();
-            _ = Task.Run(() => LoopAsync(cts.Token));
-            log("server", $"Serveur local démarré sur http://127.0.0.1:{port}");
-        }
-        catch (HttpListenerException ex)
-        {
-            log("error", $"Impossible d'ouvrir le port {port} : {ex.Message}");
-        }
-    }
-
-    private async Task LoopAsync(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested && listener.IsListening)
-        {
-            try
+            var builder = WebApplication.CreateBuilder(new WebApplicationOptions
             {
-                var context = await listener.GetContextAsync();
-                _ = Task.Run(() => HandleAsync(context), token);
-            }
-            catch when (token.IsCancellationRequested || !listener.IsListening) { }
-            catch (Exception ex) { log("error", $"Serveur local : {ex.Message}"); }
-        }
-    }
+                Args = Array.Empty<string>(),
+                ApplicationName = typeof(LocalServer).Assembly.GetName().Name
+            });
 
-    private async Task HandleAsync(HttpListenerContext context)
-    {
-        try
-        {
-            context.Response.Headers["Access-Control-Allow-Origin"] = "*";
-            var path = context.Request.Url?.AbsolutePath ?? "/";
-            if (path == "/api/status")
-                await Json(context, new { ok = true, service = "Noxo Parental Control", embedded = true, port });
-            else if (path == "/api/agent-config")
-                await Json(context, config());
-            else if (path == "/api/agent-event" && context.Request.HttpMethod == "POST")
+            builder.Logging.ClearProviders();
+            builder.WebHost.UseUrls(Url);
+
+            app = builder.Build();
+
+            app.MapGet("/api/status", () => Results.Json(new
             {
-                using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding);
-                var body = await reader.ReadToEndAsync();
+                ok = true,
+                service = "Noxo Parental Control",
+                embedded = true,
+                port,
+                version = UpdateChecker.CurrentVersion.ToString(3),
+                time = DateTimeOffset.UtcNow
+            }));
+
+            app.MapGet("/api/agent-config", () => Results.Json(config()));
+
+            app.MapPost("/api/agent-event", async (HttpRequest request) =>
+            {
                 try
                 {
-                    var item = JsonSerializer.Deserialize<AgentEvent>(body);
-                    if (item != null) log(item.Type ?? "agent", item.Message ?? "");
+                    var item = await JsonSerializer.DeserializeAsync<AgentEvent>(request.Body);
+                    if (item != null && !string.IsNullOrWhiteSpace(item.Message))
+                        log(item.Type ?? "agent", item.Message);
                 }
-                catch { }
-                await Json(context, new { ok = true });
-            }
-            else if (path == "/")
-                await Html(context);
-            else
-            {
-                context.Response.StatusCode = 404;
-                await Json(context, new { error = "Not found" });
-            }
+                catch (JsonException) { }
+
+                return Results.Json(new { ok = true });
+            });
+
+            app.MapGet("/", () => Results.Content(DashboardHtml(), "text/html; charset=utf-8"));
+
+            app.MapGet("/dashboard", () => Results.Content(DashboardHtml(), "text/html; charset=utf-8"));
+
+            app.StartAsync().GetAwaiter().GetResult();
+            IsRunning = true;
+            log("server", $"Serveur web intégré démarré sur {Url}");
         }
-        catch (Exception ex) { log("error", $"Requête locale : {ex.Message}"); }
-        finally { try { context.Response.Close(); } catch { } }
+        catch (Exception ex)
+        {
+            IsRunning = false;
+            try { app?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
+            app = null;
+            log("error", $"Impossible de démarrer le serveur web sur {Url} : {ex.Message}");
+        }
     }
 
-    private static async Task Json(HttpListenerContext c, object value)
-    {
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(value));
-        c.Response.ContentType = "application/json; charset=utf-8";
-        c.Response.ContentLength64 = bytes.Length;
-        await c.Response.OutputStream.WriteAsync(bytes);
-    }
-
-    private static async Task Html(HttpListenerContext c)
-    {
-        const string html = "<!doctype html><html lang='fr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Noxo Parental Control</title><style>body{margin:0;background:#0b1220;color:#e5e7eb;font-family:Segoe UI,Arial}.wrap{max-width:900px;margin:60px auto;padding:24px}.card{background:#111827;border:1px solid #243044;border-radius:18px;padding:24px}h1{margin:0 0 8px}.ok{color:#4ade80}.muted{color:#94a3b8}code{background:#020617;padding:4px 8px;border-radius:6px}</style></head><body><div class='wrap'><div class='card'><h1>Noxo Parental Control</h1><div class='ok'>● Serveur local actif</div><p class='muted'>Le serveur est intégré directement dans NoxoParental.exe.</p><p>API : <code>/api/status</code> · <code>/api/agent-config</code></p></div></div></body></html>";
-        var bytes = Encoding.UTF8.GetBytes(html);
-        c.Response.ContentType = "text/html; charset=utf-8";
-        c.Response.ContentLength64 = bytes.Length;
-        await c.Response.OutputStream.WriteAsync(bytes);
-    }
+    private string DashboardHtml() => $"""
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Noxo Parental Control</title>
+<style>
+:root {{ color-scheme: dark; }}
+* {{ box-sizing:border-box }} body {{ margin:0; font-family:Segoe UI,Arial,sans-serif; background:#070b14; color:#e5e7eb }}
+.wrap {{ max-width:1100px; margin:auto; padding:32px }}
+header {{ display:flex; justify-content:space-between; gap:20px; align-items:center; margin-bottom:24px }}
+h1 {{ margin:0; font-size:30px }} .muted {{ color:#94a3b8 }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px }}
+.card {{ background:#111827; border:1px solid #243044; border-radius:18px; padding:20px; box-shadow:0 10px 30px #0003 }}
+.value {{ font-size:28px; font-weight:700; margin-top:8px }}
+.ok {{ color:#4ade80 }} .warn {{ color:#fbbf24 }} .err {{ color:#f87171 }}
+button {{ border:0; border-radius:10px; padding:10px 14px; background:#4f46e5; color:white; cursor:pointer; font-weight:600 }}
+button:hover {{ background:#6366f1 }}
+pre {{ white-space:pre-wrap; word-break:break-word; color:#cbd5e1 }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<div><h1>Noxo Parental Control</h1><div class="muted">Dashboard local intégré à NoxoParental.exe</div></div>
+<button onclick="refresh()">Actualiser</button>
+</header>
+<div class="grid">
+<div class="card"><div class="muted">État</div><div id="state" class="value">Connexion…</div></div>
+<div class="card"><div class="muted">Version</div><div id="version" class="value">—</div></div>
+<div class="card"><div class="muted">Port</div><div id="port" class="value">{port}</div></div>
+<div class="card"><div class="muted">Limite quotidienne</div><div id="limit" class="value">—</div></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Configuration</h2><pre id="config">Chargement…</pre></div>
+</div>
+<script>
+async function refresh() {{
+ try {{
+  const s=await fetch('/api/status').then(r=>r.json());
+  const c=await fetch('/api/agent-config').then(r=>r.json());
+  document.querySelector('#state').textContent=s.ok?'● Actif':'● Erreur';
+  document.querySelector('#state').className='value '+(s.ok?'ok':'err');
+  document.querySelector('#version').textContent=s.version||'—';
+  document.querySelector('#port').textContent=s.port||'—';
+  document.querySelector('#limit').textContent=(c.dailyLimitMinutes??'—')+' min';
+  document.querySelector('#config').textContent=JSON.stringify(c,null,2);
+ }} catch(e) {{ document.querySelector('#state').textContent='● Erreur'; document.querySelector('#state').className='value err'; }}
+}}
+refresh(); setInterval(refresh,5000);
+</script>
+</body></html>
+""";
 
     public void Dispose()
     {
-        try { cts?.Cancel(); } catch { }
-        try { listener.Stop(); listener.Close(); } catch { }
-        cts?.Dispose();
+        IsRunning = false;
+        try { app?.StopAsync().GetAwaiter().GetResult(); } catch { }
+        try { app?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
+        app = null;
     }
 
-    private sealed class AgentEvent { public string? Type { get; set; } public string? Message { get; set; } }
+    private sealed class AgentEvent
+    {
+        public string? Type { get; set; }
+        public string? Message { get; set; }
+    }
 }
