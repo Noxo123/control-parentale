@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>NoxoParental</AssemblyName>
     <RootNamespace>NoxoParental</RootNamespace>
-    <Version>1.0.6</Version>
-    <AssemblyVersion>1.0.6.0</AssemblyVersion>
-    <FileVersion>1.0.6.0</FileVersion>
+    <Version>1.0.7</Version>
+    <AssemblyVersion>1.0.7.0</AssemblyVersion>
+    <FileVersion>1.0.7.0</FileVersion>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
